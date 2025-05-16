@@ -1,0 +1,491 @@
+```plaintext
+blockbadge-monorepo/
+├── README.md
+├── smart-contract/
+│   ├── contracts/UniversityCredential.sol
+│   ├── scripts/deploy.ts
+│   ├── test/UniversityCredential.ts
+│   ├── hardhat.config.ts
+│   └── .env.example
+└── web/
+    ├── package.json
+    ├── vite.config.ts
+    ├── .env.example
+    ├── public/
+    │   └── index.html
+    └── src/
+        ├── index.css
+        ├── App.tsx
+        ├── components/
+        │   ├── IssuerPanel.tsx
+        │   └── StudentView.tsx
+        └── hooks/
+            └── useContract.ts
+```
+
+---
+
+### README.md
+
+````markdown
+# BlockBadge Monorepo
+
+This repository contains both the smart-contract and web application for BlockBadge, an on-chain academic credentialing system using soul-bound NFTs on Base Sepolia.
+
+## Structure
+- `smart-contract/`: Hardhat project
+- `web/`: Vite + React frontend
+
+## Getting Started
+
+### Smart Contract
+```bash
+cd smart-contract
+npm install
+cp .env.example .env       # Fill env
+npx hardhat compile
+npx hardhat test
+npx hardhat run scripts/deploy.ts --network baseSepolia
+````
+
+### Web
+
+```bash
+cd web
+npm install
+cp .env.example .env       # Fill env
+npm run dev
+```
+
+## Environment Variables
+
+See each `.env.example` in subfolders.
+
+````
+---
+### smart-contract/.env.example
+```dotenv
+BASE_SEPOLIA_URL="https://base-sepolia.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+DEPLOYER_PRIVATE_KEY="0xYOUR_PRIVATE_KEY"
+````
+
+---
+
+### smart-contract/hardhat.config.ts
+
+```ts
+import { HardhatUserConfig } from 'hardhat/config';
+import '@nomicfoundation/hardhat-toolbox';
+import 'dotenv/config';
+
+const config: HardhatUserConfig = {
+  solidity: '0.8.24',
+  networks: {
+    baseSepolia: {
+      url: process.env.BASE_SEPOLIA_URL || '',
+      chainId: 84532,
+      accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
+    },
+  },
+  etherscan: {
+    apiKey: process.env.BASE_SEPOLIA_API_KEY,
+  },
+  paths: {
+    tests: 'test',
+    sources: 'contracts',
+    cache: 'cache',
+    artifacts: 'artifacts',
+  },
+};
+
+export default config;
+```
+
+---
+
+### smart-contract/contracts/UniversityCredential.sol
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+
+/// @title UniversityCredential
+/// @notice Soul-bound academic credentials as NFTs
+contract UniversityCredential is ERC721URIStorage, AccessControl {
+    using Counters for Counters.Counter;
+    Counters.Counter private _tokenIds;
+
+    bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
+
+    event Locked(uint256 tokenId);
+    event Unlocked(uint256 tokenId);
+    event CredentialRevoked(uint256 indexed tokenId);
+
+    struct CredentialData {
+        string title;
+        string description;
+        string evidenceURI;
+        uint256 mintedAt;
+        bool revoked;
+    }
+
+    mapping(uint256 => CredentialData) private _credentials;
+
+    constructor(address issuer) ERC721("UniversityCredential", "UCRED") {
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(ISSUER_ROLE, issuer);
+    }
+
+    function mintCredential(
+        address student,
+        string memory title,
+        string memory description,
+        string memory evidenceURI,
+        string memory tokenURI_
+    ) external onlyRole(ISSUER_ROLE) returns (uint256) {
+        _tokenIds.increment();
+        uint256 newId = _tokenIds.current();
+        _safeMint(student, newId);
+        _setTokenURI(newId, tokenURI_);
+        _credentials[newId] = CredentialData(title, description, evidenceURI, block.timestamp, false);
+        emit Locked(newId);
+        return newId;
+    }
+
+    function revokeCredential(uint256 tokenId) external onlyRole(ISSUER_ROLE) {
+        require(_exists(tokenId), "Not exist");
+        _credentials[tokenId].revoked = true;
+        emit CredentialRevoked(tokenId);
+    }
+
+    function _beforeTokenTransfer(address from, address to, uint256 tokenId) internal override {
+        super._beforeTokenTransfer(from, to, tokenId);
+        require(from == address(0) || to == address(0), "Soul-bound: cannot transfer");
+        if (to == address(0)) emit Unlocked(tokenId);
+    }
+
+    function getCredential(uint256 tokenId) external view returns (CredentialData memory) {
+        require(_exists(tokenId), "Not exist");
+        return _credentials[tokenId];
+    }
+
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721URIStorage, AccessControl) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+}
+```
+
+---
+
+### smart-contract/scripts/deploy.ts
+
+```ts
+import { ethers } from 'hardhat';
+import fs from 'fs';
+import path from 'path';
+
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  console.log('Deploying with', deployer.address);
+
+  const Factory = await ethers.getContractFactory('UniversityCredential');
+  const contract = await Factory.deploy(deployer.address);
+  await contract.deployed();
+
+  console.log('Contract at', contract.address);
+
+  // Write address to web/
+  const dest = path.resolve(__dirname, '../web/contractAddress.json');
+  fs.writeFileSync(dest, JSON.stringify({ address: contract.address }, null, 2));
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+---
+
+### smart-contract/test/UniversityCredential.ts
+
+```ts
+import { expect } from 'chai';
+import { ethers } from 'hardhat';
+
+describe('UniversityCredential', () => {
+  let contract: any;
+  let issuer: any;
+  let student: any;
+
+  beforeEach(async () => {
+    [issuer, student] = await ethers.getSigners();
+    const Factory = await ethers.getContractFactory('UniversityCredential');
+    contract = await Factory.deploy(issuer.address);
+    await contract.deployed();
+  });
+
+  it('mints and locks', async () => {
+    const tx = await contract.connect(issuer).mintCredential(
+      student.address,
+      'Title', 'Desc', 'https://evidence',
+      'ipfs://hash'
+    );
+    const receipt = await tx.wait();
+    const tokenId = receipt.events[0].args[0];
+
+    expect(await contract.ownerOf(tokenId)).to.eq(student.address);
+    expect(await contract.getCredential(tokenId)).to.include({ title: 'Title' });
+  });
+
+  it('blocks transfer', async () => {
+    const tx = await contract.connect(issuer).mintCredential(
+      student.address, 'T', 'D', 'U', 'uri'
+    );
+    const tokenId = (await tx.wait()).events[0].args[0];
+    await expect(
+      contract.connect(student).transferFrom(student.address, issuer.address, tokenId)
+    ).to.be.revertedWith('Soul-bound: cannot transfer');
+  });
+
+  it('revokes', async () => {
+    const tx = await contract.connect(issuer).mintCredential(
+      student.address, 'T', 'D', 'U', 'uri'
+    );
+    const tokenId = (await tx.wait()).events[0].args[0];
+    await contract.connect(issuer).revokeCredential(tokenId);
+    const data = await contract.getCredential(tokenId);
+    expect(data.revoked).to.be.true;
+  });
+});
+```
+
+---
+
+### web/package.json
+
+```json
+{
+  "name": "blockbadge-web",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "wagmi": "^2.0.0",
+    "ethers": "^6.0.0",
+    "viem": "^1.0.0",
+
+    "@tanstack/react-query": "^4.0.0",
+    "nft.storage": "^5.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vite": "^4.0.0",
+    "@vitejs/plugin-react": "^3.0.0",
+    "tailwindcss": "^3.0.0",
+    "postcss": "^8.0.0",
+    "autoprefixer": "^10.0.0"
+  }
+}
+```
+
+---
+
+### web/.env.example
+
+```dotenv
+VITE_CONTRACT_ADDRESS=""
+VITE_BASE_SEPOLIA_ID="84532"
+VITE_NFT_STORAGE_KEY="YOUR_NFT_STORAGE_KEY"
+VITE_WALLETCONNECT_PROJECT_ID="YOUR_WC_PROJECT_ID"
+```
+
+---
+
+### web/vite.config.ts
+
+```ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  define: {
+    'process.env': {}
+  },
+  server: { port: 5173 }
+});
+```
+
+---
+
+### web/public/index.html
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BlockBadge</title>
+</head>
+<body class="bg-gray-100">
+  <div id="root"></div>
+  <script type="module" src="/src/App.tsx"></script>
+</body>
+</html>
+```
+
+---
+
+### web/src/index.css
+
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body { margin: 0; font-family: sans-serif; }
+```
+
+---
+
+### web/src/hooks/useContract.ts
+
+```ts
+import { useContractRead, useContractWrite, useWaitForTransaction } from 'wagmi';
+import contractAbi from '../../smart-contract/artifacts/contracts/UniversityCredential.sol/UniversityCredential.json';
+
+export function useContract(address: string) {
+  const config = { address, abi: contractAbi.abi };
+  return {
+    mint: useContractWrite({ ...config, functionName: 'mintCredential' }),
+    revoke: useContractWrite({ ...config, functionName: 'revokeCredential' }),
+    balanceOf: useContractRead({ ...config, functionName: 'balanceOf' }),
+    tokenURI: useContractRead({ ...config, functionName: 'tokenURI' }),
+  };
+}
+```
+
+---
+
+### web/src/components/IssuerPanel.tsx
+
+```tsx
+import React, { useState } from 'react';
+import { useConnect, useAccount } from 'wagmi';
+import { useContract } from '../hooks/useContract';
+
+export function IssuerPanel() {
+  const { address } = useAccount();
+  const issuer = import.meta.env.VITE_ISSUER_ADDRESS;
+  const { mint } = useContract(import.meta.env.VITE_CONTRACT_ADDRESS);
+
+  const [student, setStudent] = useState('');
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [evidence, setEvidence] = useState('');
+
+  const handleMint = async () => {
+    const uri = await uploadMetadata(); // implement upload
+    mint.write({ args: [student, title, description, evidence, uri] });
+  };
+
+  return address?.toLowerCase() === issuer.toLowerCase() ? (
+    <div className="card">
+      <h2>Issuer Panel</h2>
+      <input value={student} onChange={e => setStudent(e.target.value)} placeholder="Student address" />
+      <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Title" />
+      <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="Description" />
+      <input value={evidence} onChange={e => setEvidence(e.target.value)} placeholder="Evidence URL" />
+      <button onClick={handleMint}>Mint</button>
+    </div>
+  ) : null;
+}
+```
+
+---
+
+### web/src/components/StudentView\.tsx
+
+```tsx
+import React, { useEffect, useState } from 'react';
+import { useContract } from '../hooks/useContract';
+import { useAccount } from 'wagmi';
+
+export function StudentView() {
+  const { address } = useAccount();
+  const { balanceOf, tokenURI } = useContract(import.meta.env.VITE_CONTRACT_ADDRESS);
+  const [tokens, setTokens] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!address) return;
+    async function fetchTokens() {
+      const balance = await balanceOf.read({ args: [address] });
+      const list: string[] = [];
+      for (let i = 0; i < Number(balance); i++) {
+        // assume enumerable, else track IDs differently
+        const uri = await tokenURI.read({ args: [i] });
+        list.push(uri as string);
+      }
+      setTokens(list);
+    }
+    fetchTokens();
+  }, [address]);
+
+  return (
+    <div className="card">
+      <h2>Your Credentials</h2>
+      <ul>
+        {tokens.map((uri, i) => (
+          <li key={i}><a href={uri} target="_blank">Credential #{i + 1}</a></li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+---
+
+### web/src/App.tsx
+
+```tsx
+import React from 'react';
+import { WagmiConfig, createConfig, configureChains } from 'wagmi';
+import { publicProvider } from 'wagmi/providers/public';
+import { mainnet } from 'viem/chains';
+import { IssuerPanel } from './components/IssuerPanel';
+import { StudentView } from './components/StudentView';
+import './index.css';
+
+const { chains, publicClient } = configureChains(
+  [{ id: 84532, name: 'Base Sepolia', network: 'baseSepolia', rpcUrls: { default: import.meta.env.VITE_BASE_SEPOLIA_URL } }],
+  [publicProvider()]
+);
+const wagmiConfig = createConfig({ autoConnect: true, publicClient });
+
+export default function App() {
+  return (
+    <WagmiConfig config={wagmiConfig}>
+      <div className="min-h-screen flex flex-col items-center justify-center p-4">
+        <IssuerPanel />
+        <StudentView />
+      </div>
+    </WagmiConfig>
+);
+}
+```
+
+```
+```
